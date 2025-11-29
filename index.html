@@ -1,0 +1,638 @@
+import React, { useState, useEffect, useRef } from 'react';
+// createRoot import removed as it causes conflict with index.tsx
+
+// --- FONTS & ICONS ---
+// In a real environment, ensure these are loaded in index.html
+// <link href="https://fonts.googleapis.com/css2?family=DynaPuff:wght@400;500;600;700&family=Arial+Nova&display=swap" rel="stylesheet">
+// Icons are inline SVGs for portability.
+
+// --- TYPES & INTERFACES (Merged from types.ts) ---
+type Role = 'guest' | 'applicant' | 'committee' | 'admin';
+type Area = 'Blaenavon' | 'Thornhill & Upper Cwmbran' | 'Trevethin, Penygarn & St. Cadocs' | 'Cross-Area';
+type AppStatus = 'Draft' | 'Submitted-Stage1' | 'Rejected-Stage1' | 'Invited-Stage2' | 'Submitted-Stage2' | 'Finalist' | 'Funded' | 'Rejected';
+
+interface User {
+  uid: string;
+  email: string;
+  username?: string;
+  role: Role;
+  area?: Area;
+  displayName?: string;
+  password?: string;
+  bio?: string;
+  phone?: string;
+  photoUrl?: string;
+}
+
+interface Application {
+  id: string;
+  userId: string;
+  applicantName: string;
+  orgName: string;
+  projectTitle: string;
+  area: Area;
+  summary: string;
+  amountRequested: number;
+  totalCost: number;
+  status: AppStatus;
+  priority?: string;
+  createdAt: number;
+  ref: string;
+  pdfUrl?: string; // Stage 1 EOI PDF
+  stage2PdfUrl?: string; // Stage 2 Full App PDF
+}
+
+interface ScoreCriterion {
+  id: string;
+  name: string;
+  guidance: string;
+  weight: number;
+  details: string;
+}
+
+interface Score {
+  appId: string;
+  scorerId: string;
+  scorerName: string;
+  scores: Record<string, number>;
+  notes: Record<string, string>;
+  isFinal: boolean;
+  total: number;
+  timestamp: number;
+}
+
+// --- CONSTANTS (Merged from constants.ts) ---
+const AREAS: Area[] = [
+  'Blaenavon',
+  'Thornhill & Upper Cwmbran',
+  'Trevethin, Penygarn & St. Cadocs'
+];
+
+const POSTCODES: Record<string, string[]> = {
+  'Blaenavon': ['NP49AA', 'NP49AB', 'NP49AC', 'NP49AD', 'NP49AE'],
+  'Thornhill & Upper Cwmbran': ['NP445AA', 'NP445AB', 'NP445AC', 'NP445AD'],
+  'Trevethin, Penygarn & St. Cadocs': ['NP48AA', 'NP48AB', 'NP48AC', 'NP48AD']
+};
+
+const ROLE_PERMISSIONS = {
+  applicant: { canSubmit: true, canScore: false, canManage: false, canExport: false },
+  committee: { canSubmit: false, canScore: true, canManage: false, canExport: false },
+  admin: { canSubmit: true, canScore: true, canManage: true, canExport: true }
+};
+
+const SCORING_CRITERIA: ScoreCriterion[] = [
+  { id: "overview", name: "Project Overview & SMART Objectives", guidance: "Clarity of overview and objectives.", weight: 10, details: "0: No clear overview... 3: Concise, compelling overview." },
+  { id: "priorities", name: "Local Priorities Alignment", guidance: "Connection to local needs.", weight: 10, details: "0: No link... 3: Direct alignment." },
+  { id: "benefit", name: "Community Benefit", guidance: "Potential benefits and outcomes.", weight: 10, details: "0: Benefits unclear... 3: Compelling benefits." },
+  { id: "delivery", name: "Activities & Milestones", guidance: "Feasibility of plan.", weight: 10, details: "0: Not credible... 3: Comprehensive plan." },
+  { id: "budget", name: "Budget & Value", guidance: "Transparency of costs.", weight: 10, details: "0: Unclear costs... 3: Fully justified." }
+];
+
+const COMMITTEE_DOCS = [
+    { title: 'PB 1.1 - EOI Form', desc: 'The main Expression of Interest application form (Part 1).', url: '#' },
+    { title: 'PB 1.2 - Priorities Report', desc: 'A report detailing funding priorities.', url: '#' },
+    { title: 'PB 2.1 - Full Application', desc: 'The full application form for shortlisted projects.', url: '#' },
+];
+
+const DEMO_USERS: User[] = [
+  { email: 'admin@torfaen.gov.uk', username: 'admin', password: 'demo', role: 'admin', uid: 'admin_01', displayName: 'System Admin', bio: 'Portal Admin' },
+  { email: 'applicant@gmail.com', username: 'applicant', password: 'demo', role: 'applicant', uid: 'app_01', displayName: 'Local Hero' },
+  { email: 'louise.white@committee.local', username: 'louise.white', password: 'demo', role: 'committee', uid: 'comm_bln_01', area: 'Blaenavon', displayName: 'Louise White' },
+];
+
+const DEMO_APPS: Application[] = [
+  { id: 'app_1', userId: 'app_01', applicantName: 'Local Hero', orgName: 'Blaenavon Blues', projectTitle: 'Pitch Improvements', area: 'Blaenavon', summary: 'Improving drainage.', amountRequested: 4500, totalCost: 6000, status: 'Submitted-Stage2', createdAt: Date.now(), ref: 'PB-BLN-123', pdfUrl: 'https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf' }
+];
+
+// --- SERVICES (Mock Backend) ---
+class MockService {
+  private get<T>(key: string): T[] {
+    const data = localStorage.getItem(key);
+    return data ? JSON.parse(data) : [];
+  }
+  private set<T>(key: string, data: T[]) {
+    localStorage.setItem(key, JSON.stringify(data));
+  }
+  constructor() {
+    if (!localStorage.getItem('apps')) this.set('apps', DEMO_APPS);
+    if (!localStorage.getItem('scores')) this.set('scores', []);
+    const users = this.get<User>('users');
+    if (users.length === 0) this.set('users', DEMO_USERS);
+  }
+  async login(identifier: string, pass: string): Promise<User> {
+    await new Promise(r => setTimeout(r, 600));
+    let emailSearch = identifier.toLowerCase();
+    if (!emailSearch.includes('@')) emailSearch = `${emailSearch}@committee.local`;
+    const users = this.get<User>('users');
+    const user = users.find(u => (u.email.toLowerCase() === emailSearch || u.username?.toLowerCase() === identifier.toLowerCase()) && u.password === pass);
+    if (user) { const { password, ...safe } = user; return safe as User; }
+    throw new Error("Invalid credentials. Try 'admin' / 'demo'");
+  }
+  async register(email: string, pass: string, name: string): Promise<User> {
+    await new Promise(r => setTimeout(r, 600));
+    const users = this.get<User>('users');
+    if (users.find(u => u.email === email)) throw new Error("User exists");
+    const newUser: User = { uid: 'user_' + Date.now(), email, password: pass, role: 'applicant', displayName: name };
+    this.set('users', [...users, newUser]);
+    const { password, ...safe } = newUser;
+    return safe as User;
+  }
+  async getApplications(area?: string): Promise<Application[]> {
+    const apps = this.get<Application>('apps');
+    if (!area || area === 'All') return apps;
+    return apps.filter(a => a.area === area || a.area === 'Cross-Area');
+  }
+  async createApplication(app: any): Promise<void> {
+    const apps = this.get<Application>('apps');
+    const newApp = { ...app, id: 'app_' + Date.now(), createdAt: Date.now(), status: 'Submitted-Stage1', ref: `PB-${app.area.substring(0,3).toUpperCase()}-${Math.floor(Math.random()*900)+100}` };
+    this.set('apps', [...apps, newApp]);
+  }
+  async updateApplication(id: string, updates: Partial<Application>): Promise<void> {
+      const apps = this.get<Application>('apps');
+      const idx = apps.findIndex(a => a.id === id);
+      if (idx !== -1) { apps[idx] = { ...apps[idx], ...updates }; this.set('apps', apps); }
+  }
+  async saveScore(score: Score): Promise<void> {
+    const scores = this.get<Score>('scores');
+    const idx = scores.findIndex(s => s.appId === score.appId && s.scorerId === score.scorerId);
+    if (idx >= 0) scores[idx] = score; else scores.push(score);
+    this.set('scores', scores);
+  }
+  async getScores(): Promise<Score[]> { return this.get<Score>('scores'); }
+  async getUsers(): Promise<User[]> { return this.get<User>('users'); }
+}
+const api = new MockService();
+
+// --- UI COMPONENTS (Styled to Match Design) ---
+
+const Button: React.FC<React.ButtonHTMLAttributes<HTMLButtonElement> & { variant?: 'primary' | 'secondary' | 'outline' | 'ghost' | 'danger' }> = ({ variant = 'primary', className = '', ...props }) => {
+    const base = "font-dynapuff font-bold rounded-xl transition-all duration-200 active:scale-95 disabled:opacity-50 inline-flex items-center justify-center gap-2 px-6 py-3";
+    const variants = {
+        primary: "bg-[#9333ea] hover:bg-[#7e22ce] text-white shadow-lg shadow-purple-200 hover:-translate-y-1",
+        secondary: "bg-[#14b8a6] hover:bg-[#0f766e] text-white shadow-lg shadow-teal-200 hover:-translate-y-1",
+        outline: "border-2 border-[#9333ea] text-[#9333ea] hover:bg-purple-50",
+        ghost: "text-gray-600 hover:bg-purple-50 hover:text-[#9333ea]",
+        danger: "bg-red-100 text-red-600 hover:bg-red-200 border border-red-200"
+    };
+    return <button className={`${base} ${variants[variant]} ${className}`} {...props} />;
+};
+
+const Card: React.FC<{ children: React.ReactNode; className?: string; onClick?: () => void }> = ({ children, className = '', onClick }) => (
+    <div onClick={onClick} className={`bg-white/90 backdrop-blur-sm rounded-3xl shadow-xl border border-white/50 p-6 ${onClick ? 'cursor-pointer hover:-translate-y-1 hover:shadow-2xl transition-all duration-300' : ''} ${className}`}>
+        {children}
+    </div>
+);
+
+const Input: React.FC<React.InputHTMLAttributes<HTMLInputElement> & { label?: string }> = ({ label, className = '', ...props }) => (
+    <div className="mb-4">
+        {label && <label className="block text-sm font-bold text-gray-700 mb-2 font-dynapuff">{label}</label>}
+        <input className={`w-full px-4 py-3 rounded-xl border border-gray-200 focus:border-[#9333ea] focus:ring-4 focus:ring-purple-100 outline-none transition-all font-arial bg-white/80 ${className}`} {...props} />
+    </div>
+);
+
+const Badge: React.FC<{ children: React.ReactNode, color?: string }> = ({ children, color = 'purple' }) => (
+    <span className={`px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wide bg-${color}-100 text-${color}-700 border border-${color}-200`}>
+        {children}
+    </span>
+);
+
+const Modal: React.FC<{ isOpen: boolean; onClose: () => void; title: string; children: React.ReactNode }> = ({ isOpen, onClose, title, children }) => {
+    if (!isOpen) return null;
+    return (
+        <div className="fixed inset-0 bg-[#9333ea]/20 backdrop-blur-sm z-50 flex items-center justify-center p-4 animate-fade-in">
+            <div className="bg-white rounded-3xl w-full max-w-2xl max-h-[90vh] flex flex-col shadow-2xl border-4 border-white animate-slide-up">
+                <div className="p-6 border-b border-gray-100 flex justify-between items-center bg-gray-50/50 rounded-t-3xl">
+                    <h3 className="text-2xl font-bold font-dynapuff text-[#9333ea]">{title}</h3>
+                    <button onClick={onClose} className="text-gray-400 hover:text-red-500">
+                        <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" /></svg>
+                    </button>
+                </div>
+                <div className="p-6 overflow-y-auto custom-scrollbar">{children}</div>
+            </div>
+        </div>
+    );
+};
+
+// --- VIEWS: PUBLIC ---
+
+const Landing: React.FC<{ onNavigate: (page: string) => void }> = ({ onNavigate }) => {
+    const [slideIndex, setSlideIndex] = useState(0);
+    const slides = [
+        { name: 'Blaenavon', color: 'text-purple-700', desc: 'Vote for projects in Blaenavon!' },
+        { name: 'Thornhill & Upper Cwmbran', color: 'text-teal-700', desc: 'Vote for projects in Thornhill!' },
+        { name: 'Trevethin & Penygarn', color: 'text-pink-700', desc: 'Vote for projects in Trevethin!' }
+    ];
+
+    return (
+        <div className="animate-fade-in pb-20">
+            <section className="pt-16 pb-12 text-center px-4">
+                <h1 className="text-5xl md:text-7xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-[#9333ea] to-[#14b8a6] mb-6 font-dynapuff drop-shadow-sm">
+                    You Decide. <br/> You Benefit.
+                </h1>
+                <p className="text-xl text-gray-600 max-w-2xl mx-auto font-arial leading-relaxed mb-8">
+                    Welcome to the Round 2 Application Cycle (2026). Apply for funding or join a committee to shape the future of Torfaen.
+                </p>
+                <div className="flex justify-center gap-4">
+                    <Button size="lg" onClick={() => onNavigate('register')}>Apply for Funding</Button>
+                    <Button size="lg" variant="outline" onClick={() => onNavigate('timeline')}>View Timeline</Button>
+                </div>
+            </section>
+
+            {/* Custom Carousel */}
+            <div className="max-w-4xl mx-auto px-4">
+                <div className="relative bg-white rounded-3xl shadow-2xl overflow-hidden h-96 border border-gray-100">
+                    <div className="absolute inset-0 flex transition-transform duration-500" style={{ transform: `translateX(-${slideIndex * 100}%)` }}>
+                        {slides.map((s, i) => (
+                            <div key={i} className="min-w-full h-full flex flex-col items-center justify-center p-8 bg-gradient-to-b from-gray-50 to-white">
+                                <div className="w-24 h-24 bg-gray-200 rounded-full mb-6 flex items-center justify-center text-4xl">🗺️</div>
+                                <h3 className={`text-4xl font-bold font-dynapuff mb-4 ${s.color}`}>{s.name}</h3>
+                                <p className="text-gray-500 mb-8 text-lg">{s.desc}</p>
+                                <Button onClick={() => onNavigate('check-postcode')}>View & Vote</Button>
+                            </div>
+                        ))}
+                    </div>
+                    <button onClick={() => setSlideIndex(curr => curr === 0 ? slides.length - 1 : curr - 1)} className="absolute left-4 top-1/2 -translate-y-1/2 bg-white/80 p-3 rounded-full shadow-lg hover:bg-white text-[#9333ea]"><svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7"/></svg></button>
+                    <button onClick={() => setSlideIndex(curr => curr === slides.length - 1 ? 0 : curr + 1)} className="absolute right-4 top-1/2 -translate-y-1/2 bg-white/80 p-3 rounded-full shadow-lg hover:bg-white text-[#9333ea]"><svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7"/></svg></button>
+                </div>
+            </div>
+        </div>
+    );
+};
+
+const Timeline: React.FC = () => {
+    const events = [
+        { date: 'Jan - May', title: 'Have Your Say!', desc: 'Community priorities identified via survey.', status: 'done' },
+        { date: 'June 20', title: 'Applications Open', desc: 'Round 2 EOI submissions begin.', status: 'active' },
+        { date: 'Aug 01', title: 'EOI Deadline', desc: 'Midnight deadline for Part 1 forms.', status: 'future' },
+        { date: 'Sept 10', title: 'Full Application', desc: 'Part 2 detailed submission deadline.', status: 'future' },
+        { date: 'Nov', title: 'Public Vote', desc: 'Community voting events take place.', status: 'future' },
+    ];
+    return (
+        <div className="py-12 px-4 max-w-6xl mx-auto">
+            <div className="text-center mb-12">
+                <h1 className="text-4xl font-bold font-dynapuff text-[#9333ea]">Initiative Timeline</h1>
+                <p className="text-gray-600 mt-2">Key dates for the 2026 funding cycle.</p>
+            </div>
+            <div className="overflow-x-auto pb-8 custom-scrollbar">
+                <div className="flex min-w-[1000px] justify-between relative px-10 pt-10">
+                    <div className="absolute top-1/2 left-0 w-full h-2 bg-gradient-to-r from-[#9333ea] to-[#14b8a6] -z-10 rounded-full opacity-30 transform -translate-y-1/2"></div>
+                    {events.map((e, i) => (
+                        <div key={i} className="flex flex-col items-center relative group w-48 text-center">
+                            <div className={`w-12 h-12 rounded-full border-4 flex items-center justify-center font-bold text-lg mb-4 bg-white z-10 transition-transform group-hover:scale-110 ${e.status === 'done' ? 'border-[#9333ea] text-[#9333ea]' : e.status === 'active' ? 'border-[#14b8a6] bg-[#14b8a6] text-white shadow-lg shadow-teal-200' : 'border-gray-300 text-gray-300'}`}>
+                                {e.status === 'done' ? '✓' : i + 1}
+                            </div>
+                            <div className="bg-white p-4 rounded-xl shadow-lg border border-purple-50 w-full hover:-translate-y-2 transition-transform duration-300">
+                                <span className="text-xs font-bold text-[#9333ea] uppercase tracking-wide">{e.date}</span>
+                                <h3 className="font-dynapuff font-bold text-gray-800 text-lg leading-tight my-1">{e.title}</h3>
+                                <p className="text-xs text-gray-500">{e.desc}</p>
+                            </div>
+                        </div>
+                    ))}
+                </div>
+            </div>
+        </div>
+    );
+};
+
+const Priorities: React.FC = () => {
+    const [tab, setTab] = useState('blaenavon');
+    const data = {
+        blaenavon: [ { l: 'Youth Services', v: 80 }, { l: 'Transport', v: 65 }, { l: 'Health', v: 50 } ],
+        thornhill: [ { l: 'Wellbeing', v: 90 }, { l: 'Sustainability', v: 70 }, { l: 'Safety', v: 40 } ],
+        trevethin: [ { l: 'Environment', v: 85 }, { l: 'Elderly Care', v: 75 }, { l: 'Skills', v: 60 } ]
+    };
+    
+    return (
+        <div className="py-12 px-4 max-w-4xl mx-auto">
+            <h1 className="text-4xl font-bold font-dynapuff text-[#9333ea] text-center mb-8">Community Priorities</h1>
+            <div className="flex justify-center mb-8 border-b-2 border-white/50">
+                {Object.keys(data).map(k => (
+                    <button key={k} onClick={() => setTab(k)} className={`px-6 py-3 font-dynapuff font-bold capitalize transition-colors rounded-t-xl ${tab === k ? 'bg-white text-[#9333ea] shadow-sm' : 'text-gray-500 hover:text-[#9333ea]'}`}>
+                        {k.replace('_', ' ')}
+                    </button>
+                ))}
+            </div>
+            <Card>
+                <div className="space-y-6">
+                    {data[tab as keyof typeof data].map((d, i) => (
+                        <div key={i}>
+                            <div className="flex justify-between mb-1 font-bold text-gray-700">
+                                <span>{d.l}</span>
+                                <span>{d.v}%</span>
+                            </div>
+                            <div className="w-full bg-gray-100 rounded-full h-4 overflow-hidden">
+                                <div className="bg-gradient-to-r from-[#9333ea] to-[#14b8a6] h-full rounded-full transition-all duration-1000" style={{ width: `${d.v}%` }}></div>
+                            </div>
+                        </div>
+                    ))}
+                </div>
+            </Card>
+        </div>
+    );
+};
+
+// --- VIEWS: SECURE (Dashboards) ---
+
+const ApplicantDashboard: React.FC<{ user: User }> = ({ user }) => {
+    const [apps, setApps] = useState<Application[]>([]);
+    const [view, setView] = useState<'list' | 'create'>('list');
+    const [formData, setFormData] = useState({ projectTitle: '', orgName: '', amountRequested: 0, summary: '', area: 'Blaenavon' });
+
+    useEffect(() => { api.getApplications().then(res => setApps(res.filter(a => a.userId === user.uid))); }, [user]);
+
+    const handleSubmit = async (e: React.FormEvent) => {
+        e.preventDefault();
+        await api.createApplication({ ...formData, userId: user.uid, applicantName: user.displayName || 'Applicant', totalCost: Number(formData.amountRequested) + 500 });
+        const res = await api.getApplications();
+        setApps(res.filter(a => a.userId === user.uid));
+        setView('list');
+    };
+
+    if (view === 'create') {
+        return (
+            <div className="max-w-2xl mx-auto py-8 px-4 animate-fade-in">
+                <Button variant="ghost" onClick={() => setView('list')}>&larr; Back</Button>
+                <Card className="mt-4">
+                    <h2 className="text-2xl font-bold font-dynapuff text-[#9333ea] mb-6">New Application (Stage 1)</h2>
+                    <form onSubmit={handleSubmit} className="space-y-4">
+                        <Input label="Project Title" value={formData.projectTitle} onChange={e => setFormData({...formData, projectTitle: e.target.value})} required />
+                        <Input label="Organization" value={formData.orgName} onChange={e => setFormData({...formData, orgName: e.target.value})} required />
+                        <div>
+                            <label className="block text-sm font-bold text-gray-700 mb-2 font-dynapuff">Area</label>
+                            <select className="w-full px-4 py-3 rounded-xl border border-gray-200" value={formData.area} onChange={e => setFormData({...formData, area: e.target.value as Area})}>
+                                {AREAS.map(a => <option key={a} value={a}>{a}</option>)}
+                            </select>
+                        </div>
+                        <Input label="Amount (£)" type="number" value={formData.amountRequested} onChange={e => setFormData({...formData, amountRequested: Number(e.target.value)})} required />
+                        <div className="flex justify-end gap-2 pt-4">
+                            <Button type="button" variant="ghost" onClick={() => setView('list')}>Cancel</Button>
+                            <Button type="submit">Submit EOI</Button>
+                        </div>
+                    </form>
+                </Card>
+            </div>
+        );
+    }
+
+    return (
+        <div className="max-w-5xl mx-auto py-12 px-4">
+            <div className="flex justify-between items-center mb-8">
+                <div>
+                    <h2 className="text-3xl font-bold font-dynapuff text-[#9333ea]">My Applications</h2>
+                    <p className="text-gray-500">Welcome back, {user.displayName}</p>
+                </div>
+                {ROLE_PERMISSIONS.applicant.canSubmit && <Button onClick={() => setView('create')}>+ New Application</Button>}
+            </div>
+            <div className="grid gap-4">
+                {apps.length === 0 && <p className="text-center text-gray-400 py-10">No applications yet.</p>}
+                {apps.map(app => (
+                    <Card key={app.id} className="flex justify-between items-center group">
+                        <div className="flex items-center gap-4">
+                            <div className="w-12 h-12 rounded-xl bg-purple-100 text-[#9333ea] flex items-center justify-center font-bold text-xl">£</div>
+                            <div>
+                                <h3 className="font-bold text-lg group-hover:text-[#9333ea] transition-colors">{app.projectTitle}</h3>
+                                <p className="text-sm text-gray-500">{app.ref} • {app.status}</p>
+                            </div>
+                        </div>
+                        <Badge color={app.status.includes('Submitted') ? 'green' : 'amber'}>{app.status}</Badge>
+                    </Card>
+                ))}
+            </div>
+        </div>
+    );
+};
+
+const CommitteeDashboard: React.FC<{ user: User }> = ({ user }) => {
+    const [view, setView] = useState<'home' | 'score'>('home');
+    const [apps, setApps] = useState<Application[]>([]);
+    const [activeApp, setActiveApp] = useState<Application | null>(null);
+    const [scores, setScores] = useState<Record<string, number>>({});
+    const [notes, setNotes] = useState<Record<string, string>>({});
+
+    useEffect(() => {
+        const fetch = async () => {
+            const res = await api.getApplications(user.area);
+            setApps(res);
+            // Load existing scores for this user could go here
+        };
+        fetch();
+    }, [user]);
+
+    const handleScore = (app: Application) => {
+        setActiveApp(app);
+        setView('score');
+        setScores({}); // Reset for demo
+        setNotes({});
+    };
+
+    const submitScore = async () => {
+        if (!activeApp) return;
+        const total = Object.values(scores).reduce((a, b) => a + b, 0); // Simplified calculation
+        await api.saveScore({
+            appId: activeApp.id, scorerId: user.uid, scorerName: user.displayName || 'Committee',
+            scores, notes, isFinal: true, total: total * 3.3, timestamp: Date.now()
+        });
+        alert('Score submitted!');
+        setActiveApp(null);
+        setView('home');
+    };
+
+    if (view === 'score' && activeApp) {
+        return (
+            <div className="fixed inset-0 top-20 bg-gray-100 z-40 flex">
+                {/* PDF Viewer (Left) */}
+                <div className="w-1/2 h-full border-r border-gray-300 bg-gray-500 flex flex-col">
+                    <div className="bg-white p-2 border-b flex justify-between items-center">
+                        <span className="font-bold font-dynapuff">{activeApp.projectTitle} (PDF View)</span>
+                        <Button size="sm" variant="ghost" onClick={() => setView('home')}>Close</Button>
+                    </div>
+                    <iframe src={activeApp.pdfUrl} className="w-full h-full" title="PDF"></iframe>
+                </div>
+                {/* Scoring Matrix (Right) */}
+                <div className="w-1/2 h-full overflow-y-auto bg-white p-8 pb-32">
+                    <h2 className="text-2xl font-bold font-dynapuff text-[#9333ea] mb-6">Scoring Matrix</h2>
+                    <div className="space-y-6">
+                        {SCORING_CRITERIA.map(c => (
+                            <div key={c.id} className="p-4 rounded-xl border border-gray-100 shadow-sm bg-gray-50">
+                                <div className="flex justify-between mb-2">
+                                    <h4 className="font-bold text-gray-800">{c.name}</h4>
+                                    <span className="font-bold text-[#9333ea] text-xl">{scores[c.id] || 0}</span>
+                                </div>
+                                <p className="text-xs text-gray-500 mb-4">{c.guidance}</p>
+                                <input 
+                                    type="range" min="0" max="3" step="1" 
+                                    className="w-full accent-[#9333ea] h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer mb-4"
+                                    value={scores[c.id] || 0}
+                                    onChange={e => setScores({...scores, [c.id]: Number(e.target.value)})}
+                                />
+                                <textarea 
+                                    className="w-full p-2 text-sm border border-gray-200 rounded-lg" 
+                                    placeholder="Justification notes..."
+                                    value={notes[c.id] || ''}
+                                    onChange={e => setNotes({...notes, [c.id]: e.target.value})}
+                                />
+                            </div>
+                        ))}
+                    </div>
+                    <div className="fixed bottom-0 right-0 w-1/2 p-4 bg-white border-t flex justify-end gap-4 shadow-lg">
+                        <Button variant="ghost" onClick={() => setView('home')}>Cancel</Button>
+                        <Button onClick={submitScore}>Submit Final Score</Button>
+                    </div>
+                </div>
+            </div>
+        );
+    }
+
+    return (
+        <div className="max-w-6xl mx-auto py-12 px-4">
+            <h2 className="text-3xl font-bold font-dynapuff text-[#9333ea] mb-2">Committee Portal</h2>
+            <p className="text-gray-500 mb-8">Assigned Area: <span className="font-bold text-gray-800">{user.area}</span></p>
+            
+            <div className="grid md:grid-cols-3 gap-6 mb-12">
+                <Card className="text-center hover:bg-purple-50" onClick={() => {}}>
+                    <div className="text-4xl mb-4">📊</div>
+                    <h3 className="font-bold font-dynapuff">Scoring Matrix</h3>
+                </Card>
+                <Card className="text-center hover:bg-teal-50" onClick={() => {}}>
+                    <div className="text-4xl mb-4">📂</div>
+                    <h3 className="font-bold font-dynapuff">Documents Hub</h3>
+                </Card>
+                <Card className="text-center hover:bg-blue-50" onClick={() => {}}>
+                    <div className="text-4xl mb-4">👁️</div>
+                    <h3 className="font-bold font-dynapuff">App Viewer</h3>
+                </Card>
+            </div>
+
+            <h3 className="text-xl font-bold font-dynapuff text-gray-700 mb-4">Outstanding Applications</h3>
+            <div className="bg-white rounded-3xl shadow-xl border border-gray-100 overflow-hidden">
+                {apps.map(app => (
+                    <div key={app.id} className="p-4 border-b border-gray-100 flex justify-between items-center hover:bg-gray-50">
+                        <div>
+                            <span className="text-xs font-bold text-gray-400">{app.ref}</span>
+                            <h4 className="font-bold text-gray-800">{app.projectTitle}</h4>
+                            <p className="text-sm text-gray-500">{app.applicantName}</p>
+                        </div>
+                        <Button size="sm" onClick={() => handleScore(app)}>Score</Button>
+                    </div>
+                ))}
+                {apps.length === 0 && <p className="p-8 text-center text-gray-400">No applications assigned.</p>}
+            </div>
+        </div>
+    );
+};
+
+// --- MAIN APP COMPONENT ---
+
+const App: React.FC = () => {
+    const [page, setPage] = useState('landing');
+    const [user, setUser] = useState<User | null>(null);
+    const [isAuthOpen, setIsAuthOpen] = useState(false);
+    const [authMode, setAuthMode] = useState<'login' | 'register'>('login');
+    
+    // Auth Form State
+    const [email, setEmail] = useState('');
+    const [pass, setPass] = useState('');
+    const [name, setName] = useState('');
+    const [error, setError] = useState('');
+
+    const handleAuth = async (e: React.FormEvent) => {
+        e.preventDefault();
+        setError('');
+        try {
+            let u;
+            if (authMode === 'login') u = await api.login(email, pass);
+            else u = await api.register(email, pass, name);
+            setUser(u);
+            setIsAuthOpen(false);
+            setPage(u.role === 'committee' || u.role === 'admin' ? 'committee' : 'applicant');
+        } catch (err: any) {
+            setError(err.message);
+        }
+    };
+
+    // Styling
+    const bgGradient = "bg-gradient-to-br from-purple-100 via-purple-200 to-teal-100 min-h-screen text-slate-800 font-arial";
+
+    return (
+        <div className={bgGradient}>
+            <style>{`
+                @import url('https://fonts.googleapis.com/css2?family=DynaPuff:wght@400;500;600;700&family=Arial+Nova&display=swap');
+                .font-dynapuff { font-family: 'DynaPuff', cursive; }
+                .font-arial { font-family: 'Arial Nova', Arial, sans-serif; }
+                .custom-scrollbar::-webkit-scrollbar { width: 6px; height: 6px; }
+                .custom-scrollbar::-webkit-scrollbar-thumb { background: #d8b4fe; border-radius: 3px; }
+            `}</style>
+
+            {/* Navbar */}
+            <nav className="sticky top-0 z-30 bg-white/80 backdrop-blur-md border-b border-white/50 shadow-sm h-20">
+                <div className="container mx-auto px-4 h-full flex justify-between items-center">
+                    <div className="flex items-center gap-2 cursor-pointer" onClick={() => setPage('landing')}>
+                        <div className="w-10 h-10 bg-[#9333ea] rounded-full flex items-center justify-center text-white font-dynapuff font-bold">CC</div>
+                        <span className="font-dynapuff font-bold text-xl text-[#9333ea] hidden sm:block">Communities' Choice</span>
+                    </div>
+                    <div className="flex items-center gap-4">
+                        {!user ? (
+                            <>
+                                <button onClick={() => setPage('check-postcode')} className="font-dynapuff font-bold text-[#9333ea] hover:bg-purple-50 px-3 py-2 rounded-lg transition-colors">Vote</button>
+                                <button onClick={() => setPage('priorities')} className="font-dynapuff font-bold text-[#9333ea] hover:bg-purple-50 px-3 py-2 rounded-lg transition-colors hidden md:block">Priorities</button>
+                                <Button size="sm" onClick={() => { setAuthMode('login'); setIsAuthOpen(true); }} className="bg-purple-100 text-[#9333ea] hover:bg-purple-200 shadow-none">Portal Login</Button>
+                            </>
+                        ) : (
+                            <div className="flex items-center gap-4">
+                                <span className="font-bold text-sm hidden sm:block">{user.displayName}</span>
+                                <Button variant="danger" size="sm" onClick={() => { setUser(null); setPage('landing'); }}>Logout</Button>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            </nav>
+
+            {/* Main Content Router */}
+            <main>
+                {page === 'landing' && <Landing onNavigate={setPage} />}
+                {page === 'timeline' && <Timeline />}
+                {page === 'priorities' && <Priorities />}
+                {page === 'check-postcode' && (
+                    <div className="min-h-[80vh] flex items-center justify-center p-4">
+                        <Card className="max-w-md w-full text-center">
+                            <h2 className="text-2xl font-bold font-dynapuff text-[#9333ea] mb-4">Verify Residency</h2>
+                            <p className="text-gray-600 mb-6">Enter your postcode to proceed to the voting form.</p>
+                            <Input placeholder="e.g. NP4 9AA" className="text-center uppercase font-bold text-xl tracking-widest" />
+                            <Button className="w-full">Check Postcode</Button>
+                        </Card>
+                    </div>
+                )}
+                {page === 'applicant' && user && <ApplicantDashboard user={user} />}
+                {page === 'committee' && user && <CommitteeDashboard user={user} />}
+            </main>
+
+            {/* Footer */}
+            <footer className="bg-white/50 border-t border-white py-8 mt-12 text-center">
+                <p className="font-dynapuff font-bold text-gray-600">Communities' Choice PB Initiative</p>
+                <p className="text-xs text-gray-400 mt-2">&copy; 2026 Torfaen County Borough Council</p>
+            </footer>
+
+            {/* Auth Modal */}
+            <Modal isOpen={isAuthOpen} onClose={() => setIsAuthOpen(false)} title={authMode === 'login' ? 'Portal Access' : 'Create Account'}>
+                <form onSubmit={handleAuth} className="space-y-4">
+                    {authMode === 'register' && <Input label="Full Name" value={name} onChange={e => setName(e.target.value)} required />}
+                    <Input label="Email or Username" value={email} onChange={e => setEmail(e.target.value)} required />
+                    <Input label="Password" type="password" value={pass} onChange={e => setPass(e.target.value)} required />
+                    {error && <p className="text-red-500 text-sm font-bold bg-red-50 p-2 rounded">{error}</p>}
+                    <Button type="submit" className="w-full">{authMode === 'login' ? 'Log In' : 'Register'}</Button>
+                    <p className="text-center text-sm text-gray-500 cursor-pointer hover:text-[#9333ea]" onClick={() => setAuthMode(authMode === 'login' ? 'register' : 'login')}>
+                        {authMode === 'login' ? 'Need an account? Register' : 'Have an account? Login'}
+                    </p>
+                    <div className="pt-4 border-t mt-4 text-xs text-center text-gray-400">
+                        <p>Demo Logins:</p>
+                        <p>Admin: admin / demo</p>
+                        <p>Committee: louise.white / demo</p>
+                        <p>Applicant: applicant / demo</p>
+                    </div>
+                </form>
+            </Modal>
+        </div>
+    );
+};
+
+export default App;
